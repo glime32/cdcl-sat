@@ -1,6 +1,11 @@
 // Solveur CDCL : propagation avec deux littéraux surveillés, apprentissage
-// de clauses (1-UIP), heuristique VSIDS, sauvegarde de phase, redémarrages
-// de Luby et nettoyage des clauses apprises selon leur LBD.
+// de clauses (1-UIP) avec minimisation, heuristique VSIDS, sauvegarde de
+// phase, redémarrages de Luby et nettoyage des clauses apprises selon leur LBD.
+//
+// Toutes les clauses vivent dans un seul Vec<u32> (l'« arène ») : une clause
+// = 2 mots d'en-tête puis ses littéraux. Une référence de clause est l'indice
+// de son en-tête. C'est beaucoup plus rapide qu'un Vec par clause, parce que
+// la propagation passe son temps à sauter d'une clause à l'autre.
 
 pub type Lit = u32; // 2*var pour x, 2*var+1 pour ¬x
 
@@ -21,25 +26,22 @@ pub fn to_dimacs(l: Lit) -> i32 {
     if l & 1 == 1 { -v } else { v }
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Val {
-    Undef,
-    True,
-    False,
-}
+const TRUE: i8 = 1;
+const FALSE: i8 = -1;
+const UNDEF: i8 = 0;
 
-struct Clause {
-    lits: Vec<Lit>,
-    learnt: bool,
-    deleted: bool,
-    lbd: u32,
-    activity: f64,
-}
+// en-tête : [taille | appris << 31 | supprimé << 30] [lbd]
+const HEADER: usize = 2;
+const LEARNT: u32 = 1 << 31;
+const DELETED: u32 = 1 << 30;
+const SIZE_MASK: u32 = (1 << 30) - 1;
+const NO_REASON: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
 struct Watch {
     cref: u32,
     blocker: Lit,
+    binary: bool, // clause à 2 littéraux : le « bloqueur » est l'autre littéral
 }
 
 #[derive(Default, Debug, Clone)]
@@ -60,20 +62,23 @@ pub enum Outcome {
 
 pub struct Solver {
     nvars: usize,
-    clauses: Vec<Clause>,
+    arena: Vec<u32>,
+    wasted: usize,
+    learnts: Vec<u32>,
     watches: Vec<Vec<Watch>>,
-    assign: Vec<Val>,
+    values: Vec<i8>, // indexé par littéral
     level: Vec<u32>,
-    reason: Vec<Option<u32>>,
+    reason: Vec<u32>,
     trail: Vec<Lit>,
     trail_lim: Vec<usize>,
     qhead: usize,
     activity: Vec<f64>,
     var_inc: f64,
-    cla_inc: f64,
     heap: Heap,
     phase: Vec<bool>,
     seen: Vec<bool>,
+    stack: Vec<Lit>,
+    to_clear: Vec<usize>,
     unsat: bool,
     pub stats: Stats,
     pub max_conflicts: Option<u64>,
@@ -83,20 +88,23 @@ impl Solver {
     pub fn new(nvars: usize) -> Solver {
         let mut s = Solver {
             nvars,
-            clauses: Vec::new(),
+            arena: Vec::new(),
+            wasted: 0,
+            learnts: Vec::new(),
             watches: vec![Vec::new(); 2 * nvars],
-            assign: vec![Val::Undef; nvars],
+            values: vec![UNDEF; 2 * nvars],
             level: vec![0; nvars],
-            reason: vec![None; nvars],
+            reason: vec![NO_REASON; nvars],
             trail: Vec::with_capacity(nvars),
             trail_lim: Vec::new(),
             qhead: 0,
             activity: vec![0.0; nvars],
             var_inc: 1.0,
-            cla_inc: 1.0,
             heap: Heap::new(nvars),
             phase: vec![false; nvars],
             seen: vec![false; nvars],
+            stack: Vec::new(),
+            to_clear: Vec::new(),
             unsat: false,
             stats: Stats::default(),
             max_conflicts: None,
@@ -107,14 +115,19 @@ impl Solver {
         s
     }
 
-    fn value(&self, l: Lit) -> Val {
-        match self.assign[var(l)] {
-            Val::Undef => Val::Undef,
-            Val::True => if l & 1 == 0 { Val::True } else { Val::False },
-            Val::False => if l & 1 == 0 { Val::False } else { Val::True },
-        }
+    #[inline]
+    fn size(&self, c: u32) -> usize {
+        (self.arena[c as usize] & SIZE_MASK) as usize
     }
-
+    #[inline]
+    fn lits(&self, c: u32) -> &[Lit] {
+        let start = c as usize + HEADER;
+        &self.arena[start..start + self.size(c)]
+    }
+    #[inline]
+    fn value(&self, l: Lit) -> i8 {
+        self.values[l as usize]
+    }
     fn decision_level(&self) -> u32 {
         self.trail_lim.len() as u32
     }
@@ -130,35 +143,43 @@ impl Solver {
         if c.windows(2).any(|w| w[0] == neg(w[1])) {
             return; // x ∨ ¬x : toujours vraie
         }
-        c.retain(|&l| self.value(l) != Val::False);
-        if c.iter().any(|&l| self.value(l) == Val::True) {
+        if c.iter().any(|&l| self.value(l) == TRUE) {
             return;
         }
+        c.retain(|&l| self.value(l) != FALSE);
         match c.len() {
             0 => self.unsat = true,
             1 => {
-                self.enqueue(c[0], None);
+                self.enqueue(c[0], NO_REASON);
                 if self.propagate().is_some() {
                     self.unsat = true;
                 }
             }
             _ => {
-                self.attach(c, false, 0);
+                self.attach(&c, false, 0);
             }
         }
     }
 
-    fn attach(&mut self, lits: Vec<Lit>, learnt: bool, lbd: u32) -> u32 {
-        let cref = self.clauses.len() as u32;
-        self.watches[lits[0] as usize].push(Watch { cref, blocker: lits[1] });
-        self.watches[lits[1] as usize].push(Watch { cref, blocker: lits[0] });
-        self.clauses.push(Clause { lits, learnt, deleted: false, lbd, activity: 0.0 });
+    fn attach(&mut self, lits: &[Lit], learnt: bool, lbd: u32) -> u32 {
+        let cref = self.arena.len() as u32;
+        self.arena.push(lits.len() as u32 | if learnt { LEARNT } else { 0 });
+        self.arena.push(lbd);
+        self.arena.extend_from_slice(lits);
+        let binary = lits.len() == 2;
+        self.watches[lits[0] as usize].push(Watch { cref, blocker: lits[1], binary });
+        self.watches[lits[1] as usize].push(Watch { cref, blocker: lits[0], binary });
+        if learnt {
+            self.learnts.push(cref);
+        }
         cref
     }
 
-    fn enqueue(&mut self, l: Lit, reason: Option<u32>) {
+    #[inline]
+    fn enqueue(&mut self, l: Lit, reason: u32) {
         let v = var(l);
-        self.assign[v] = if l & 1 == 0 { Val::True } else { Val::False };
+        self.values[l as usize] = TRUE;
+        self.values[neg(l) as usize] = FALSE;
         self.level[v] = self.decision_level();
         self.reason[v] = reason;
         self.trail.push(l);
@@ -167,69 +188,92 @@ impl Solver {
     /// Propagation unitaire. watches[l] contient les clauses qui surveillent l :
     /// quand l devient faux, il faut leur trouver un autre littéral non faux.
     fn propagate(&mut self) -> Option<u32> {
-        let mut conflict = None;
-        while self.qhead < self.trail.len() && conflict.is_none() {
+        while self.qhead < self.trail.len() {
             let p = self.trail[self.qhead];
             self.qhead += 1;
             self.stats.propagations += 1;
             let false_lit = neg(p);
             let mut ws = std::mem::take(&mut self.watches[false_lit as usize]);
             let (mut i, mut j) = (0, 0);
-            while i < ws.len() {
+            let n = ws.len();
+            let mut conflict = None;
+            'watches: while i < n {
                 let w = ws[i];
                 i += 1;
-                if self.value(w.blocker) == Val::True {
+                let bv = self.values[w.blocker as usize];
+                if bv == TRUE {
                     ws[j] = w;
                     j += 1;
                     continue;
                 }
-                let cref = w.cref as usize;
-                if self.clauses[cref].deleted {
+                if w.binary {
+                    // pas besoin de lire la clause : l'autre littéral est le bloqueur
+                    let c = w.cref as usize;
+                    if self.arena[c] & DELETED != 0 {
+                        continue;
+                    }
+                    ws[j] = w;
+                    j += 1;
+                    if bv == FALSE {
+                        conflict = Some(w.cref);
+                        while i < n {
+                            ws[j] = ws[i];
+                            j += 1;
+                            i += 1;
+                        }
+                    } else {
+                        if self.arena[c + HEADER] != w.blocker {
+                            self.arena.swap(c + HEADER, c + HEADER + 1); // le littéral impliqué en tête
+                        }
+                        self.enqueue(w.blocker, w.cref);
+                    }
                     continue;
                 }
-                {
-                    let c = &mut self.clauses[cref].lits;
-                    if c[0] == false_lit {
-                        c.swap(0, 1);
-                    }
+                let c = w.cref as usize;
+                let head = self.arena[c];
+                if head & DELETED != 0 {
+                    continue;
                 }
-                let first = self.clauses[cref].lits[0];
-                if first != w.blocker && self.value(first) == Val::True {
-                    ws[j] = Watch { cref: w.cref, blocker: first };
+                let size = (head & SIZE_MASK) as usize;
+                let lits = c + HEADER;
+                if self.arena[lits] == false_lit {
+                    self.arena.swap(lits, lits + 1);
+                }
+                let first = self.arena[lits];
+                let w2 = Watch { cref: w.cref, blocker: first, binary: false };
+                if first != w.blocker && self.values[first as usize] == TRUE {
+                    ws[j] = w2;
                     j += 1;
                     continue;
                 }
-                let mut moved = false;
-                let n = self.clauses[cref].lits.len();
-                for k in 2..n {
-                    let l = self.clauses[cref].lits[k];
-                    if self.value(l) != Val::False {
-                        self.clauses[cref].lits.swap(1, k);
-                        self.watches[l as usize].push(Watch { cref: w.cref, blocker: first });
-                        moved = true;
-                        break;
+                for k in 2..size {
+                    let l = self.arena[lits + k];
+                    if self.values[l as usize] != FALSE {
+                        self.arena.swap(lits + 1, lits + k);
+                        self.watches[l as usize].push(w2);
+                        continue 'watches;
                     }
                 }
-                if moved {
-                    continue;
-                }
-                ws[j] = Watch { cref: w.cref, blocker: first };
+                ws[j] = w2;
                 j += 1;
-                if self.value(first) == Val::False {
+                if self.values[first as usize] == FALSE {
                     conflict = Some(w.cref);
-                    while i < ws.len() {
+                    while i < n {
                         ws[j] = ws[i];
                         j += 1;
                         i += 1;
                     }
                 } else {
-                    self.enqueue(first, Some(w.cref));
+                    self.enqueue(first, w.cref);
                 }
             }
             ws.truncate(j);
             self.watches[false_lit as usize] = ws;
+            if conflict.is_some() {
+                return conflict;
+            }
         }
-        conflict
+        None
     }
 
     fn bump_var(&mut self, v: usize) {
@@ -243,37 +287,25 @@ impl Solver {
         self.heap.increase(v, &self.activity);
     }
 
-    fn bump_clause(&mut self, cref: usize) {
-        let c = &mut self.clauses[cref];
-        c.activity += self.cla_inc;
-        if c.activity > 1e20 {
-            for c in self.clauses.iter_mut().filter(|c| c.learnt) {
-                c.activity *= 1e-20;
-            }
-            self.cla_inc *= 1e-20;
-        }
-    }
-
     /// Analyse du conflit : on remonte les raisons depuis la clause en conflit
     /// jusqu'au premier point d'implication unique (1-UIP) du dernier niveau.
-    fn analyze(&mut self, mut confl: u32) -> (Vec<Lit>, u32) {
-        let mut learnt: Vec<Lit> = vec![0];
+    fn analyze(&mut self, mut confl: u32, learnt: &mut Vec<Lit>) -> u32 {
+        learnt.clear();
+        learnt.push(0);
         let mut path = 0;
         let mut p: Option<Lit> = None;
         let mut index = self.trail.len();
+        let dl = self.decision_level();
         loop {
-            if self.clauses[confl as usize].learnt {
-                self.bump_clause(confl as usize);
-            }
-            let start = if p.is_some() { 1 } else { 0 };
-            let n = self.clauses[confl as usize].lits.len();
-            for k in start..n {
-                let q = self.clauses[confl as usize].lits[k];
+            let size = self.size(confl);
+            let start = confl as usize + HEADER + if p.is_some() { 1 } else { 0 };
+            for k in start..confl as usize + HEADER + size {
+                let q = self.arena[k];
                 let v = var(q);
                 if !self.seen[v] && self.level[v] > 0 {
                     self.seen[v] = true;
                     self.bump_var(v);
-                    if self.level[v] >= self.decision_level() {
+                    if self.level[v] >= dl {
                         path += 1;
                     } else {
                         learnt.push(q);
@@ -293,46 +325,72 @@ impl Solver {
             if path == 0 {
                 break;
             }
-            confl = self.reason[var(lit)].expect("littéral impliqué sans raison");
+            confl = self.reason[var(lit)];
         }
         learnt[0] = neg(p.unwrap());
 
-        // minimisation : un littéral est inutile si sa raison ne contient que
-        // des littéraux déjà dans la clause (ou fixés au niveau 0)
-        let keep: Vec<bool> = learnt
-            .iter()
-            .enumerate()
-            .map(|(k, &l)| {
-                if k == 0 {
-                    return true;
-                }
-                match self.reason[var(l)] {
-                    None => true,
-                    Some(r) => self.clauses[r as usize].lits[1..]
-                        .iter()
-                        .any(|&q| !self.seen[var(q)] && self.level[var(q)] > 0),
-                }
-            })
-            .collect();
+        // minimisation récursive : un littéral est inutile si tout ce qui l'a
+        // impliqué est déjà dans la clause (directement ou de proche en proche)
+        self.to_clear.clear();
+        self.to_clear.extend(learnt[1..].iter().map(|&l| var(l)));
+        let mut levels = 0u64;
         for &l in &learnt[1..] {
-            self.seen[var(l)] = false;
+            levels |= 1 << (self.level[var(l)] & 63);
         }
-        let mut learnt: Vec<Lit> = learnt.into_iter().zip(keep).filter(|&(_, k)| k).map(|(l, _)| l).collect();
+        let mut kept = 1;
+        for k in 1..learnt.len() {
+            let l = learnt[k];
+            if self.reason[var(l)] == NO_REASON || !self.redundant(l, levels) {
+                learnt[kept] = l;
+                kept += 1;
+            }
+        }
+        learnt.truncate(kept);
+        for &v in &self.to_clear {
+            self.seen[v] = false;
+        }
 
-        // niveau de retour : le plus haut niveau parmi les autres littéraux,
-        // qu'on place en position 1 pour qu'il soit surveillé
-        let mut back = 0;
-        if learnt.len() > 1 {
-            let mut best = 1;
-            for k in 2..learnt.len() {
-                if self.level[var(learnt[k])] > self.level[var(learnt[best])] {
-                    best = k;
+        // niveau de retour : le plus haut parmi les autres littéraux, placé en 1
+        if learnt.len() == 1 {
+            return 0;
+        }
+        let mut best = 1;
+        for k in 2..learnt.len() {
+            if self.level[var(learnt[k])] > self.level[var(learnt[best])] {
+                best = k;
+            }
+        }
+        learnt.swap(1, best);
+        self.level[var(learnt[1])]
+    }
+
+    fn redundant(&mut self, l: Lit, levels: u64) -> bool {
+        self.stack.clear();
+        self.stack.push(l);
+        let top = self.to_clear.len();
+        while let Some(x) = self.stack.pop() {
+            let r = self.reason[var(x)];
+            let size = self.size(r);
+            for k in 1..size {
+                let q = self.arena[r as usize + HEADER + k];
+                let v = var(q);
+                if self.seen[v] || self.level[v] == 0 {
+                    continue;
+                }
+                if self.reason[v] != NO_REASON && levels & (1 << (self.level[v] & 63)) != 0 {
+                    self.seen[v] = true;
+                    self.stack.push(q);
+                    self.to_clear.push(v);
+                } else {
+                    for &u in &self.to_clear[top..] {
+                        self.seen[u] = false;
+                    }
+                    self.to_clear.truncate(top);
+                    return false;
                 }
             }
-            learnt.swap(1, best);
-            back = self.level[var(learnt[1])];
         }
-        (learnt, back)
+        true
     }
 
     fn lbd(&self, lits: &[Lit]) -> u32 {
@@ -351,8 +409,9 @@ impl Solver {
             let l = self.trail[k];
             let v = var(l);
             self.phase[v] = l & 1 == 0;
-            self.assign[v] = Val::Undef;
-            self.reason[v] = None;
+            self.values[l as usize] = UNDEF;
+            self.values[neg(l) as usize] = UNDEF;
+            self.reason[v] = NO_REASON;
             if !self.heap.contains(v) {
                 self.heap.insert(v, &self.activity);
             }
@@ -364,48 +423,90 @@ impl Solver {
 
     fn pick_branch(&mut self) -> Option<Lit> {
         while let Some(v) = self.heap.pop(&self.activity) {
-            if self.assign[v] == Val::Undef {
-                let l = (v as Lit) << 1;
+            let l = (v as Lit) << 1;
+            if self.values[l as usize] == UNDEF {
                 return Some(if self.phase[v] { l } else { l | 1 });
             }
         }
         None
     }
 
-    fn locked(&self, cref: usize) -> bool {
-        let l = self.clauses[cref].lits[0];
-        self.value(l) == Val::True && self.reason[var(l)] == Some(cref as u32)
+    fn locked(&self, c: u32) -> bool {
+        let l = self.lits(c)[0];
+        self.value(l) == TRUE && self.reason[var(l)] == c
     }
 
-    /// Garde la moitié la plus utile des clauses apprises : petite LBD d'abord
-    /// (les clauses « glue » de LBD ≤ 2 ne sont jamais jetées), puis activité.
+    /// Garde la moitié la plus utile des clauses apprises : les clauses « glue »
+    /// (LBD ≤ 2) ne sont jamais jetées, les autres par LBD croissante.
     fn reduce_db(&mut self) {
-        let mut cand: Vec<usize> = (0..self.clauses.len())
-            .filter(|&i| {
-                let c = &self.clauses[i];
-                c.learnt && !c.deleted && c.lbd > 2 && !self.locked(i)
-            })
-            .collect();
-        cand.sort_by(|&a, &b| {
-            let (ca, cb) = (&self.clauses[a], &self.clauses[b]);
-            cb.lbd.cmp(&ca.lbd).then(ca.activity.partial_cmp(&cb.activity).unwrap())
+        let mut learnts = std::mem::take(&mut self.learnts);
+        learnts.sort_by_key(|&c| std::cmp::Reverse(self.arena[c as usize + 1]));
+        let target = learnts.len() / 2;
+        let mut removed = 0;
+        learnts.retain(|&c| {
+            if removed < target && self.arena[c as usize + 1] > 2 && !self.locked(c) {
+                self.wasted += HEADER + self.size(c);
+                self.arena[c as usize] |= DELETED;
+                removed += 1;
+                false
+            } else {
+                true
+            }
         });
-        for &i in &cand[..cand.len() / 2] {
-            self.clauses[i].deleted = true;
-            self.clauses[i].lits = Vec::new();
-            self.stats.deleted += 1;
+        self.stats.deleted += removed as u64;
+        self.learnts = learnts;
+        if self.wasted > self.arena.len() / 2 {
+            self.collect_garbage();
+        }
+    }
+
+    /// Recopie les clauses vivantes dans une arène neuve, et refait les listes
+    /// de surveillance et les raisons avec les nouvelles références.
+    fn collect_garbage(&mut self) {
+        let mut fresh = Vec::with_capacity(self.arena.len() - self.wasted);
+        let mut moved = vec![NO_REASON; 0];
+        moved.resize(self.arena.len(), NO_REASON);
+        let mut c = 0;
+        while c < self.arena.len() {
+            let head = self.arena[c];
+            let size = (head & SIZE_MASK) as usize;
+            if head & DELETED == 0 {
+                moved[c] = fresh.len() as u32;
+                fresh.extend_from_slice(&self.arena[c..c + HEADER + size]);
+            }
+            c += HEADER + size;
+        }
+        for r in self.reason.iter_mut() {
+            if *r != NO_REASON {
+                *r = moved[*r as usize];
+            }
+        }
+        for c in self.learnts.iter_mut() {
+            *c = moved[*c as usize];
+        }
+        self.arena = fresh;
+        self.wasted = 0;
+        for w in self.watches.iter_mut() {
+            w.clear();
+        }
+        let mut c = 0;
+        while c < self.arena.len() {
+            let size = (self.arena[c] & SIZE_MASK) as usize;
+            let (a, b) = (self.arena[c + HEADER], self.arena[c + HEADER + 1]);
+            let binary = size == 2;
+            self.watches[a as usize].push(Watch { cref: c as u32, blocker: b, binary });
+            self.watches[b as usize].push(Watch { cref: c as u32, blocker: a, binary });
+            c += HEADER + size;
         }
     }
 
     pub fn solve(&mut self) -> Outcome {
-        if self.unsat {
-            return Outcome::Unsat;
-        }
-        if self.propagate().is_some() {
+        if self.unsat || self.propagate().is_some() {
             return Outcome::Unsat;
         }
         let mut restart_idx = 0;
         let mut next_reduce = 2000u64;
+        let mut learnt = Vec::new();
         loop {
             let budget = 100 * luby(restart_idx);
             restart_idx += 1;
@@ -417,24 +518,19 @@ impl Solver {
                     if self.decision_level() == 0 {
                         return Outcome::Unsat;
                     }
-                    let (learnt, back) = self.analyze(confl);
+                    let back = self.analyze(confl, &mut learnt);
                     self.cancel_until(back);
                     if learnt.len() == 1 {
-                        self.enqueue(learnt[0], None);
+                        self.enqueue(learnt[0], NO_REASON);
                     } else {
                         let lbd = self.lbd(&learnt);
-                        let first = learnt[0];
-                        let cref = self.attach(learnt, true, lbd);
-                        self.bump_clause(cref as usize);
-                        self.enqueue(first, Some(cref));
+                        let cref = self.attach(&learnt, true, lbd);
+                        self.enqueue(learnt[0], cref);
                     }
                     self.stats.learnt += 1;
                     self.var_inc /= 0.95;
-                    self.cla_inc /= 0.999;
-                    if let Some(m) = self.max_conflicts {
-                        if self.stats.conflicts >= m {
-                            return Outcome::Unknown;
-                        }
+                    if self.max_conflicts.is_some_and(|m| self.stats.conflicts >= m) {
+                        return Outcome::Unknown;
                     }
                 } else {
                     if conflicts_here >= budget {
@@ -443,18 +539,18 @@ impl Solver {
                         break;
                     }
                     if self.stats.conflicts >= next_reduce {
-                        next_reduce = self.stats.conflicts + 2000 + 300 * self.stats.restarts;
+                        next_reduce = self.stats.conflicts + 2000 + 300 * (self.stats.deleted / 1000);
                         self.reduce_db();
                     }
                     match self.pick_branch() {
                         None => {
-                            let model = (0..self.nvars).map(|v| self.assign[v] == Val::True).collect();
+                            let model = (0..self.nvars).map(|v| self.values[v << 1] == TRUE).collect();
                             return Outcome::Sat(model);
                         }
                         Some(l) => {
                             self.stats.decisions += 1;
                             self.trail_lim.push(self.trail.len());
-                            self.enqueue(l, None);
+                            self.enqueue(l, NO_REASON);
                         }
                     }
                 }
