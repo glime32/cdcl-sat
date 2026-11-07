@@ -1,0 +1,13 @@
+[package]
+name = "cdcl-sat"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "cdcl"
+path = "src/main.rs"
+
+[profile.release]
+debug = false
+
+[dependencies]
