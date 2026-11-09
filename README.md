@@ -1,8 +1,12 @@
-# cdcl-sat
+<p align="center"><img src="docs/banner-cdcl-sat.png" alt="cdcl-sat" width="100%"></p>
 
-Un solveur SAT en Rust, sans dépendance. On lui donne une formule logique en forme normale conjonctive (« (a ou non b) et (b ou c) et ... ») et il trouve une affectation qui la rend vraie, ou prouve qu'il n'y en a pas.
+<p align="center"><img src="https://img.shields.io/badge/Rust-no%20dependencies-dea584?style=flat-square" alt="Rust"> <img src="https://img.shields.io/badge/license-MIT-610089?style=flat-square" alt="license"></p>
 
-C'est un solveur **CDCL** (*conflict-driven clause learning*), la technique derrière MiniSat, Glucose, CaDiCaL : à chaque impasse il apprend une nouvelle clause qui l'empêche de refaire la même erreur.
+A SAT solver in Rust, with no dependencies. Give it a logic formula in conjunctive normal form ("(a or not b) and (b or c) and ...") and it finds an assignment that makes it true, or proves there isn't one.
+
+<p align="center"><a href="README.fr.md">🇫🇷 Version française</a></p>
+
+It's a **CDCL** solver (*conflict-driven clause learning*), the technique behind MiniSat, Glucose, CaDiCaL: at every dead end it learns a new clause that stops it from making the same mistake again.
 
 ```
 $ cargo build --release
@@ -21,25 +25,27 @@ $ ./target/release/cdcl sudoku "8..........36......7..9.2...5...7.......457.....
 c 0.001 s, 18 conflits, 30 décisions, ...
 ```
 
-(La grille d'Arto Inkala, présentée en 2012 comme « le sudoku le plus dur du monde ». 729 variables, 12 009 clauses, 18 conflits.)
+(Arto Inkala's grid, presented in 2012 as "the world's hardest sudoku". 729 variables, 12,009 clauses, 18 conflicts.)
 
-## Utilisation
+## Usage
+
+Sub-commands are French: `reines` = queens, `pigeons` = pigeonhole, `aleatoire` = random, `genere` = generate.
 
 ```
-cdcl fichier.cnf              format DIMACS, comme les compétitions SAT (codes de sortie 10 / 20)
+cdcl fichier.cnf              DIMACS format, as in SAT competitions (exit codes 10 / 20)
 cdcl sudoku GRILLE
 cdcl reines N
-cdcl pigeons N                N+1 pigeons dans N trous
-cdcl aleatoire N RATIO        3-SAT aléatoire
+cdcl pigeons N                N+1 pigeons in N holes
+cdcl aleatoire N RATIO        random 3-SAT
 cdcl transition [N] [ESSAIS]
 cdcl genere sudoku|reines|pigeons|aleatoire ...  > probleme.cnf
 ```
 
-Quand il répond « satisfiable », le modèle est revérifié clause par clause avant d'être affiché.
+When it answers "satisfiable", the model is checked again clause by clause before being printed.
 
-## La transition de phase
+## The phase transition
 
-Des clauses de 3 littéraux tirées au hasard : avec peu de clauses par variable, presque tout est satisfiable ; avec beaucoup, presque rien. Le basculement est brutal, autour de **4,26**, et c'est exactement là que les problèmes sont les plus durs :
+Random 3-literal clauses: with few clauses per variable, almost everything is satisfiable; with many, almost nothing. The switch is sudden, around **4.26**, and that's exactly where the problems are hardest (`conflits` = conflicts):
 
 ```
 $ ./target/release/cdcl transition 120 30
@@ -53,29 +59,29 @@ $ ./target/release/cdcl transition 120 30
  6.00     0 %                          240 ▒▒▒▒▒▒▒▒▒▒▒
 ```
 
-## Les pigeons
+## The pigeons
 
-`cdcl pigeons N` demande de ranger N+1 pigeons dans N trous, un par trou. C'est évidemment impossible, mais Haken a montré en 1985 que toute preuve par résolution (ce que fait un CDCL, au fond) est de taille exponentielle. On le voit bien : 9 trous demandent déjà quelques centaines de milliers de conflits.
+`cdcl pigeons N` asks to put N+1 pigeons into N holes, one per hole. It's obviously impossible, but Haken showed in 1985 that every resolution proof (which is basically what a CDCL does) has exponential size. And it shows: 9 holes already take a few hundred thousand conflicts.
 
-## Ce qu'il y a dedans
+## What's inside
 
-- **Deux littéraux surveillés** par clause : une clause n'est regardée que quand l'un de ses deux littéraux surveillés devient faux. Chaque surveillance garde un « bloqueur », un autre littéral de la clause : s'il est vrai, inutile même de lire la clause. Pour une clause binaire, le bloqueur *est* l'autre littéral, donc on ne la lit jamais.
-- **Analyse de conflit 1-UIP** : on remonte les raisons du conflit jusqu'au premier point d'implication unique du dernier niveau, ce qui donne la clause apprise et le niveau où revenir (*backjumping*).
-- **Minimisation récursive** de la clause apprise : un littéral saute si tout ce qui l'a impliqué est déjà dans la clause.
-- **VSIDS** : chaque variable impliquée dans un conflit gagne de l'« activité », et on branche sur la plus active (tas binaire indexé). Les activités s'estompent en augmentant l'incrément de 5 % à chaque conflit.
-- **Sauvegarde de phase** : une variable reprend la dernière valeur qu'elle avait.
-- **Redémarrages** selon la suite de Luby (1 1 2 1 1 2 4 ...) × 100 conflits.
-- **Oubli** : régulièrement, la moitié des clauses apprises est jetée, en gardant celles de petite **LBD** (nombre de niveaux de décision différents dans la clause, l'idée de Glucose). Les clauses « glue » (LBD ≤ 2) restent toujours.
+- **Two watched literals** per clause: a clause is only looked at when one of its two watched literals becomes false. Each watch keeps a "blocker", another literal of the clause: if it's true, there's no need to even read the clause. For a binary clause, the blocker *is* the other literal, so it's never read.
+- **1-UIP conflict analysis**: the reasons of the conflict are followed back to the first unique implication point of the last level, which gives the learned clause and the level to go back to (*backjumping*).
+- **Recursive minimisation** of the learned clause: a literal is dropped if everything that implied it is already in the clause.
+- **VSIDS**: each variable involved in a conflict gains "activity", and the solver branches on the most active one (indexed binary heap). Activities fade by raising the increment by 5% at each conflict.
+- **Phase saving**: a variable gets back the last value it had.
+- **Restarts** following the Luby sequence (1 1 2 1 1 2 4 ...) × 100 conflicts.
+- **Clause deletion**: regularly, half of the learned clauses are thrown away, keeping those with a small **LBD** (number of distinct decision levels in the clause, Glucose's idea). "Glue" clauses (LBD ≤ 2) are always kept.
 
 ### Performance
 
-La première version stockait chaque clause dans son propre `Vec`. Ça marchait, mais la propagation passe son temps à sauter de clause en clause, et chaque saut était un défaut de cache. Maintenant toutes les clauses sont dans une seule « arène » (`Vec<u32>` : deux mots d'en-tête puis les littéraux), avec un ramasse-miettes qui la compacte quand la moitié est faite de clauses oubliées. La valeur de chaque *littéral* (et pas seulement de chaque variable) est stockée directement, sans branchement pour le signe.
+The first version stored each clause in its own `Vec`. It worked, but propagation spends its time jumping from clause to clause, and every jump was a cache miss. Now all clauses live in a single "arena" (`Vec<u32>`: two header words, then the literals), with a garbage collector that compacts it when half of it is deleted clauses. The value of each *literal* (not just each variable) is stored directly, with no branch for the sign.
 
-| | avant | après |
+| | before | after |
 |---|---|---|
-| 3-SAT aléatoire, 250 variables, ratio 4,26 | 216 µs / conflit | 20 µs / conflit |
-| pigeons 8 | 0,96 s | ~0,35 s |
+| random 3-SAT, 250 variables, ratio 4.26 | 216 µs / conflict | 20 µs / conflict |
+| pigeons 8 | 0.96 s | ~0.35 s |
 
 ## Tests
 
-`cargo test` compare le solveur à une recherche exhaustive sur 3000 formules aléatoires (jusqu'à 12 variables et 60 clauses) : même réponse à chaque fois, et chaque modèle trouvé est vérifié.
+`cargo test` compares the solver with a brute-force search on 3000 random formulas (up to 12 variables and 60 clauses): same answer every time, and every model found is checked.
